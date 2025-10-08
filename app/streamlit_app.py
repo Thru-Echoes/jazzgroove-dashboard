@@ -381,6 +381,26 @@ tab1, tab2, tab3 = st.tabs(["📈 Survival", "⚠️ Cancellation Risk", "🧪 B
 with tab1:
     # If survival curves exist, render a line chart with plan and cohort filters.
     if not surv.empty:
+        # Show an info banner about data coverage (optional but recommended)
+        st.info("Data coverage ends on **Apr 29, 2025**. Lines stop where follow-up is incomplete (right-censored).")
+
+        # Short, non-technical intro to the Survival tab
+        st.markdown(
+            """
+            ### What you’re seeing
+            - Lines show **what share of members remain active** after Month 1, 2, 3, …
+            - Lines **stop/fade** when we don’t have enough months of data.
+
+            ### How to read it
+            - **Higher lines = better retention**.
+            - **Drops** mark sensitive moments (e.g., trial end, renewal).
+
+            ### How to use it
+            - Use **Plan** and **Cohort Year** filters to compare groups.
+            - The **hazard heatmap** below shows **where churn is hottest** (darker = higher monthly drop-off).
+            """
+        )
+
         # Provide simple selectors for plan and (optionally) cohort year.
         plans = sorted(surv["Plan"].dropna().unique()) if "Plan" in surv.columns else ["All"]
         # Let users choose one or more plans to display.
@@ -407,6 +427,26 @@ with tab1:
 # Cancellation Risk tab content: dynamic watchlist for any chosen month.
 # ------------------------------------------------------------
 with tab2:
+    # Short, non-technical intro to the Risk tab
+    st.markdown(
+        """
+        ### What you’re seeing
+        - A **ranked list** of current members who look most at risk of canceling.
+        - **Hazard (1-mo)** = chance of canceling **next month**.
+        - **3-month risk** = chance of canceling **in any of the next 3 months**.
+
+        ### How to read it
+        - Bigger numbers = **higher risk**, prioritize outreach there.
+        - **Months since first** = how long they’ve been with us.
+
+        ### How to use it
+        - Pick the **as-of date** (the month you care about).
+        - Use **Min 1-mo hazard** and **Min 3-mo risk** to focus on the riskiest members.
+        - **Top N** limits the list to a manageable outreach target.
+        - Click **Download CSV** to hand to the outreach team.
+        """
+    )
+
     # Draw a date input for the as-of date, defaulting to the config param.
     as_of_default = pd.to_datetime(cfg["params"]["as_of"]).date() if "as_of" in cfg["params"] else pd.to_datetime("2025-03-31").date()
     # Render the calendar widget for selecting the risk as-of date.
@@ -446,6 +486,22 @@ with tab2:
 # Backtest tab content: supports a custom multi-month window (e.g., Feb–Apr 2025).
 # ------------------------------------------------------------
 with tab3:
+    # Short, non-technical intro to the Backtest tab
+    st.markdown(
+        """
+        ### What you’re seeing
+        - We freeze the risk list **as of a past month**, then check who **actually canceled** afterward.
+        - **Precision** = of those we flagged, how many actually canceled.
+        - **Recall** = of everyone who canceled, how many we flagged.
+        - The bar chart checks that **higher risk bins** canceled more often.
+
+        ### How to use it
+        - Choose **Hazard as-of** and an **evaluation end** (usually ~3 months later, not past Apr 29, 2025).
+        - Adjust **Min 1-mo hazard / Min 3-mo risk / Top N** to test stricter or looser lists.
+        - Download the **results CSV** if you want to review specific members.
+        """
+    )
+
     # Draw a two-column layout for inputs.
     c1, c2, c3 = st.columns([1, 1, 1])
     # The hazard-as-of date defaults to the config value but can be changed.
