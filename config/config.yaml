@@ -1,0 +1,34 @@
+# ------------------------------------------------------------
+# File and parameter configuration for the retention dashboard
+# ------------------------------------------------------------
+
+paths:
+  # Normalized events (after running scripts/00_ingest_customer_csv_to_events.py)
+  raw_events: data/raw/subscriptions.csv
+  # Survival output
+  survival_csv: data/processed/survival_curves.csv
+  # Average hazard by month output
+  hazard_csv: data/processed/pooled_hazard.csv
+  # Early-risk watchlist output
+  watchlist_csv: data/processed/early_risk_watchlist.csv
+  # Backtest outputs
+  backtest_results_csv: data/processed/backtest_apr2025_results.csv
+  backtest_metrics_csv: data/processed/backtest_apr2025_metrics.csv
+
+params:
+  # Cohort grace months to merge small gaps
+  grace_months: 3
+  # Max months to expand each subscriber timeline
+  max_months: 48
+  # Cap date for censoring (YYYY-MM-DD)
+  cap_date: "2025-04-29"
+
+  # The "as_of" date the watchlist is built for (end of month recommended)
+  as_of: "2025-01-31"
+
+  # Backtest month — used by scripts/02_backtest_watchlist_vs_actual.py
+  backtest_month_start: "2025-02-01"
+  backtest_month_end: "2025-04-30"
+
+  # How many rows to include by default in the watchlist display
+  top_n_watchlist: 500

@@ -1,0 +1,12 @@
+name: jazz-retention
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pandas>=2.2
+  - numpy>=1.26
+  - pyyaml>=6.0
+  - pip:
+      - streamlit>=1.36
+      - plotly>=5.22

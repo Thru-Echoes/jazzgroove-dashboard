@@ -1,0 +1,14 @@
+metric,value
+watchlist_rows_total,5110.0
+watchlist_rows_matchable_by_email,5110.0
+watchlist_rows_matched_to_customer,5704.0
+precision_among_matched,0.056100981767180924
+april_churners_total,292.0
+true_positives_flagged,292.0
+recall_flagged_over_all_april_churners,1.0
+"calibration_bin_(-0.0536, 0.0176]",0.07738998482549317
+"calibration_bin_(0.0176, 0.0326]",0.05124223602484472
+"calibration_bin_(0.0326, 0.0459]",0.05683563748079877
+"calibration_bin_(0.0459, 0.0717]",0.07097791798107256
+"calibration_bin_(0.0717, 0.363]",0.12286158631415241
+calibration_bin_nan,0.0303275374039628

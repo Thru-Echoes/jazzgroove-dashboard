@@ -1,0 +1,13 @@
+metric,value
+hazard_as_of,2025-01-31
+eval_start,2025-02-01
+eval_end,2025-04-30
+flagged,263
+total_churn_in_window,291
+true_positives,26
+precision_among_flagged,0.09885931558935361
+recall_flagged_over_all_window_churners,0.08934707903780069
+calibration_bin_0–5%,
+calibration_bin_5–10%,
+calibration_bin_10–20%,0.07878787878787878
+calibration_bin_20%+,0.1326530612244898
