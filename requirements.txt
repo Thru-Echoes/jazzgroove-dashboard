@@ -1,0 +1,12 @@
+# Core app framework
+streamlit>=1.36,<1.39
+
+# Data wrangling
+pandas>=2.2,<3
+numpy>=1.26,<3
+
+# Config (yaml)
+pyyaml>=6.0.1,<7
+
+# Charts
+plotly>=5.20,<6
