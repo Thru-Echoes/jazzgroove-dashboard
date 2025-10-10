@@ -696,7 +696,7 @@ so we can decide what’s real customer behavior vs. analysis artifacts—and wh
         st.warning("Bottom line: this dashboard shows us previously undetected patterns in our data that are likely going to lead to high-value fixes / decisions.")
         st.markdown(
             """
-            We see that each cohort has premium-plus (annual) subscribers that are churning before their first 12 months of a membership. That is unexpected and is a consistent pattern that has been going unnoticed for years. They may had had payment failures, unexpected plan changes, or is an artifact of data mapping issues at the Chargebee level). This is something that requires further investigation and is a high-value fix.
+            We see that each cohort has premium-plus (annual) subscribers that are churning before their first 12 months of a membership are over. That is unexpected and is a consistent pattern that has been going unnoticed for years. They may had had payment failures, unexpected plan changes, or is an artifact of data mapping issues at the Chargebee level). This is something that requires further investigation and is a high-value fix.
 This dashboard is in beta mode (development mode) and likely has unpolished issues here and there. It is meant to show initial patterns in the data and generate discussion about the pros, cons, and features desired for this app to yield the highest value.
             """
         )
