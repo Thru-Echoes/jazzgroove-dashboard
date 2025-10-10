@@ -704,16 +704,56 @@ This dashboard is in beta mode (development mode) and likely has unpolished issu
         # ----------------------------
 
         # Also show a hazard heatmap by tenure month if hazard data is present.
+        #"""if 'Month' in haz.columns and 'Avg_Hazard' in haz.columns:
+        #    import plotly.express as px
+        #    hsel = haz.copy()
+        #    hsel = hsel[hsel['Plan'].isin(sel_plans)] if 'Plan' in hsel.columns else hsel
+        #    fig_hz = px.density_heatmap(hsel, x='Month', y='Plan', z='Avg_Hazard', color_continuous_scale='Reds',
+        #                                title='Hazard Heatmap by Tenure Month', nbinsx=24)
+        #    
+        #    # Reuse the survival-based thinning boundary so both plots align
+        #    #fig_hz = add_coverage_fence(fig_hz, thinning_x, max_x)
+        #    st.plotly_chart(fig_hz, use_container_width=True)"""
+
         if 'Month' in haz.columns and 'Avg_Hazard' in haz.columns:
-            import plotly.express as px
             hsel = haz.copy()
             hsel = hsel[hsel['Plan'].isin(sel_plans)] if 'Plan' in hsel.columns else hsel
-            fig_hz = px.density_heatmap(hsel, x='Month', y='Plan', z='Avg_Hazard', color_continuous_scale='Reds',
-                                        title='Hazard Heatmap by Tenure Month', nbinsx=24)
-            
-            # Reuse the survival-based thinning boundary so both plots align
-            #fig_hz = add_coverage_fence(fig_hz, thinning_x, max_x)
+
+            # 1) Make sure Month is integer (drop bad rows), then build categorical "bands" like "0–1", "1–2", …
+            hsel["Month"] = pd.to_numeric(hsel["Month"], errors="coerce").astype("Int64")
+            hsel = hsel.dropna(subset=["Month"]).copy()
+            hsel["Month"] = hsel["Month"].astype(int)
+
+            # Use an en dash (–) for readability
+            hsel["Month_Band"] = hsel["Month"].apply(lambda m: f"{m-1}\u2013{m}")
+
+            # 2) Preserve left-to-right ordering of bands
+            month_bands = [f"{m-1}\u2013{m}" for m in sorted(hsel["Month"].unique())]
+
+            # 3) Build the heatmap using the categorical Month_Band (no numeric bin popups)
+            fig_hz = px.density_heatmap(
+                hsel,
+                x="Month_Band",
+                y="Plan",
+                z="Avg_Hazard",
+                histfunc="avg",  # average hazard if multiple rows exist per cell
+                category_orders={"Month_Band": month_bands},
+                color_continuous_scale="Reds",
+                title="Hazard Heatmap by Tenure Month",
+            )
+
+            # 4) Clean, percent-based hover + colorbar formatting
+            fig_hz.update_traces(
+                hovertemplate="Plan=%{y}<br>Month=%{x}<br>Avg hazard=%{z:.1%}<extra></extra>"
+            )
+            fig_hz.update_layout(
+                xaxis_title="Tenure month (interval covered)",
+                yaxis_title="Plan",
+                coloraxis_colorbar_tickformat=".0%"  # colorbar ticks as %
+            )
+
             st.plotly_chart(fig_hz, use_container_width=True)
+
     # If survival data is missing, provide a gentle note.
     else:
         st.info("Survival curves will appear here after the prep script is run.")
