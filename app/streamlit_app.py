@@ -1,8 +1,9 @@
-\
+
 # ------------------------------------------------------------
 # Import core libraries for I/O and computation.
 # ------------------------------------------------------------
 import os
+import math 
 # ------------------------------------------------------------
 # Import pandas for data wrangling and CSV I/O.
 # ------------------------------------------------------------
@@ -28,6 +29,8 @@ from datetime import datetime
 # ------------------------------------------------------------
 import streamlit as st
 
+
+
 # ------------------------------------------------------------
 # Define a helper to read YAML config and return as a dict.
 # ------------------------------------------------------------
@@ -42,6 +45,182 @@ def load_config(path: str) -> dict:
 def load_csv(path: str, parse_dates=None) -> pd.DataFrame:
     # If the file exists at path, load it; otherwise return empty DataFrame.
     return pd.read_csv(path, parse_dates=parse_dates) if os.path.exists(path) else pd.DataFrame()
+
+# Above each line: explain the line below
+# Define a function that takes the survival dataframe currently being plotted
+def compute_thinning_month(surv_df, min_at_risk=30):
+    # Ensure we have the columns we need
+    if not {"Month", "At_Risk"}.issubset(surv_df.columns):
+        # If columns are missing, return None (no fence)
+        return None
+    # Group by Month and sum At_Risk across cohorts/plans currently filtered
+    month_at_risk = (
+        surv_df.groupby("Month", as_index=True)["At_Risk"]
+               .sum()
+               .sort_index()
+    )
+    # Find the last month where At_Risk is still adequate
+    supported = month_at_risk[month_at_risk >= min_at_risk]
+    # If nothing is supported, skip
+    if supported.empty:
+        return None
+    # Place the fence just after the last adequately supported month
+    # (e.g., if last supported is 16, the fence appears between 16 and 17)
+    return int(supported.index.max()) + 0.5
+
+# -------------------------------
+# Helper: draw the fence on a Plotly figure (line chart or heatmap)
+# -------------------------------
+
+# Define a function to add a dashed red vline and soft shading to a Plotly figure
+def add_coverage_fence(fig, thinning_x, max_x):
+    # If there is no fence to draw, return immediately
+    if thinning_x is None:
+        return fig
+    # Add a red dashed vertical line at the thinning boundary
+    fig.add_vline(
+        x=thinning_x,
+        line_width=2,
+        line_dash="dash",
+        line_color="red"
+    )
+    # Add a light red shaded region beyond the boundary to the chart end
+    fig.add_vrect(
+        x0=thinning_x, x1=max_x + 0.5,
+        fillcolor="red",
+        opacity=0.06,
+        line_width=0,
+    )
+    # Annotate the fence so viewers know what it means
+    fig.add_annotation(
+        x=thinning_x,
+        y=1.04,            # position at top of plotting area
+        yref="paper",      # reference the vertical paper coordinate
+        text="Data thins beyond here (Apr 29, 2025 cutoff)",
+        showarrow=False,
+        font=dict(color="red", size=11),
+        xanchor="left"
+    )
+    # Return the modified figure
+    return fig
+
+# Draw fixed per‑cohort vertical "coverage fences" across a faceted figure
+def add_fixed_cohort_fences_OLD(fig, cohort_order, fence_map, max_x, cols=3, shade=True):
+    """
+    fig          : Plotly figure created with px.line(..., facet_col='Cohort Year', facet_col_wrap=cols)
+    cohort_order : ordered list of Cohort Year values *in the same dtype the figure uses*
+    fence_map    : dict {year_int: month_int or None}  e.g., {2021: 41, 2022: 29, ...}
+    max_x        : right limit to shade to (usually max Month in the plotted data)
+    cols         : number of facet columns (must match facet_col_wrap used in px.line)
+    shade        : if True, light red shading appears to the right of each fence
+    """
+    if not cohort_order:
+        return fig
+
+    for i, label in enumerate(cohort_order):
+        # Convert label to int for lookup; ignore if not convertible (defensive)
+        try:
+            yr = int(label)
+        except Exception:
+            continue
+
+        x = fence_map.get(yr)
+        if x is None:
+            continue  # no fence for this cohort
+
+        # Compute subplot position (row/col) given facet_col_wrap=cols
+        row = (i // cols) + 1
+        col = (i % cols) + 1
+
+        fig.add_vline(
+            x=x,
+            line_width=2,
+            line_dash="dash",
+            line_color="red",
+            row=row,
+            col=col,
+        )
+        if shade:
+            fig.add_vrect(
+                x0=x, x1=max_x + 0.5,
+                fillcolor="red",
+                opacity=0.06,
+                line_width=0,
+                row=row,
+                col=col,
+            )
+
+    # A single annotation at the top of the full figure
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.01, y=1.08,
+        #text="Red dashed lines mark where results may thin due to Apr 29, 2025 cutoff.",
+
+        text = "",
+        showarrow=False,
+        font=dict(color="red", size=11),
+    )
+    return fig
+
+def add_fixed_cohort_fences(fig, fence_map, max_x, shade=True, facet_col_name="Cohort Year"):
+    """
+    Draw fixed, per‑cohort vertical fences on a faceted figure made by px.line(..., facet_col=facet_col_name).
+
+    fig           : Plotly figure
+    fence_map     : dict {year_int: month_int or None}
+                    e.g. {2021: 41, 2022: 29, 2023: 17, 2024: 5, 2025: 1}
+                    Use None for cohorts that should have no fence.
+    max_x         : right limit to shade to (e.g., max tenure month shown)
+    shade         : if True, lightly shade to the right of the fence
+    facet_col_name: the name of the facet column (default "Cohort Year")
+    """
+    # Find the facet title annotations like "Cohort Year=2025"
+    anns = [
+        a for a in getattr(fig.layout, "annotations", []) 
+        if isinstance(getattr(a, "text", None), str)
+        and a.text.startswith(f"{facet_col_name}=")
+    ]
+    if not anns:
+        return fig  # no facets found, nothing to draw
+
+    # Determine the grid by the actual positions of the titles (paper coords)
+    xs = sorted({float(a.x) for a in anns})
+    ys = sorted({float(a.y) for a in anns}, reverse=True)  # top row has largest y
+
+    # Map the *label* shown in the title to its (row, col)
+    title_to_rowcol = {}
+    for a in anns:
+        label_str = a.text.split("=", 1)[1].strip()  # "2025"
+        col = xs.index(float(a.x)) + 1
+        row = ys.index(float(a.y)) + 1
+        title_to_rowcol[label_str] = (row, col)
+
+    # Add a fence for each cohort that has an entry in fence_map
+    for yr, x in fence_map.items():
+        if x is None:
+            continue
+        key = str(yr)  # facet titles are strings
+        if key not in title_to_rowcol:
+            continue  # this cohort panel isn't present (filtered out)
+        row, col = title_to_rowcol[key]
+        fig.add_vline(x=x, line_width=2, line_dash="dash", line_color="red", row=row, col=col)
+        if shade:
+            fig.add_vrect(
+                x0=x, x1=max_x + 0.5,
+                fillcolor="red", opacity=0.06, line_width=0,
+                row=row, col=col,
+            )
+
+    # One overall note to explain the fences
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.01, y=1.08,
+        #text="Red dashed lines mark where results thin due to Apr 29, 2025 cutoff.",
+        text = "",
+        showarrow=False, font=dict(color="red", size=11),
+    )
+    return fig
+
+
 
 # ------------------------------------------------------------
 # Define a function to compute a dynamic watchlist as of an arbitrary date.
@@ -382,9 +561,25 @@ with tab1:
     # If survival curves exist, render a line chart with plan and cohort filters.
     if not surv.empty:
         # Show an info banner about data coverage (optional but recommended)
-        st.info("Data coverage ends on **Apr 29, 2025**. Lines stop where follow-up is incomplete (right-censored).")
+        #st.info("Data coverage ends on **Apr 29, 2025**. Lines stop where follow-up is incomplete (right-censored).")
+        st.warning("This is a **beta (development)** dashboard. Expect rough edges. The goal is to quickly surface patterns \
+so we can decide what’s real customer behavior vs. analysis artifacts—and whether this is worth taking to production.")
 
-        # Short, non-technical intro to the Survival tab
+        #st.markdown(
+        #"""
+        #**What the lines mean & why late months can look worse**  
+        #Our data stops on **April 29, 2025**. After that, results are **incomplete**, not extra cancellations.  
+        #We draw lines up to 48 months to compare cohorts (2019–2025), but later months—especially for people who joined in 2024–2025—can look lower simply because we can’t observe them beyond April 2025. Read those later points as “what we’ve seen so far” rather than final outcomes.  
+        #Each cohort (e.g., “2023”) includes everyone who joined that year; a value like **0.38 at Month 20** means **38% of 2023 joiners were still active 20 months after they joined**.
+
+        #**Why drops can appear near Month 14, and what we discovered**  
+        #We count the **start month as Month 1**. If someone starts in Oct‑2023, they’re active through Oct‑2024 (Month 13). If they don’t renew then, the drop shows in **Month 14** (Nov‑2024).  
+        #The heatmap shows the same story at a glance: **darker cells = bigger month‑to‑month drop**.  
+        #Early insight from this beta: **annual (Premium‑Plus) lines dip before Month 12** in every cohort—sometimes around **Month 3**. That means some “annual” members are leaving early (e.g., failed payments, plan changes/refunds, or data mapping quirks). This likely went unnoticed and is a high‑value area to investigate.
+        #    """
+        #)
+
+         # Short, non-technical intro to the Survival tab
         st.markdown(
             """
             ### What you’re seeing
@@ -401,16 +596,113 @@ with tab1:
             """
         )
 
+
         # Provide simple selectors for plan and (optionally) cohort year.
         plans = sorted(surv["Plan"].dropna().unique()) if "Plan" in surv.columns else ["All"]
         # Let users choose one or more plans to display.
         sel_plans = st.multiselect("Select Plans", plans, default=plans[:2] if plans else [])
         # Filter the DataFrame based on selected plans (if the column exists).
         splot = surv[surv["Plan"].isin(sel_plans)] if "Plan" in surv.columns else surv.copy()
+
         # Create an interactive Plotly line figure for Retention over Month.
-        fig = px.line(splot, x="Month", y="Retention", color="Plan", facet_col="Cohort Year", facet_col_wrap=3, title="Monthly Survival by Cohort")
+        # We’ll keep the facet order stable but let the fence helper discover positions.
+        if pd.api.types.is_numeric_dtype(surv["Cohort Year"]):
+            cohort_order = (
+                splot["Cohort Year"].dropna().astype(int).sort_values().unique().tolist()
+            )
+        else:
+            cohort_order = sorted(
+                splot["Cohort Year"].dropna().astype(str).unique().tolist(),
+                key=lambda x: int(x)
+            )
+
+        fig = px.line(
+            splot,
+            x="Month",
+            y="Retention",
+            color="Plan",
+            facet_col="Cohort Year",
+            facet_col_wrap=3,
+            category_orders={"Cohort Year": cohort_order},
+            title="Monthly Survival by Cohort",
+        )
+
+        # Your fixed per‑cohort fences (exactly as requested)
+        FENCE_BY_COHORT = {
+            2019: None,  # no line
+            2020: None,  # no line
+            2021: 41,
+            2022: 29,
+            2023: 17,
+            2024: 5,
+            #2025: 1,
+            2025: None
+        }
+
+        # Determine a reasonable right bound for the shading
+        max_x = int(splot["Month"].max()) if ("Month" in splot.columns and not splot.empty) else 48
+
+        # Add the fences into the *correct* facet panels by reading the figure’s titles
+        fig = add_fixed_cohort_fences(
+            fig,
+            fence_map=FENCE_BY_COHORT,
+            max_x=max_x,
+            shade=True,
+            facet_col_name="Cohort Year",
+        )
+        fence_x = 1  # month where you want the dashed line for 2025
+        fig.add_vline(x=fence_x, line_width=2, line_dash="dash", line_color="red",
+                    row=1, col=1)
+        fig.add_vrect(x0=fence_x, x1=int(splot["Month"].max()) + 0.5,
+                    fillcolor="red", opacity=0.06, line_width=0,
+                    row=1, col=1)
+        
+        fence_x = 41  # month where you want the dashed line for 2021
+        fig.add_vline(x=fence_x, line_width=2, line_dash="dash", line_color="red",
+                    row=3, col=3)
+        fig.add_vrect(x0=fence_x, x1=int(splot["Month"].max()) + 0.5,
+                    fillcolor="red", opacity=0.06, line_width=0,
+                    row=3, col=3)
+
+
+        # ADD RED DASHED LINES HERE?? 
+
+        # Let the user decide how thin is "too thin" (N people still under observation)
+        
         # Display the chart in the Streamlit app.
         st.plotly_chart(fig, use_container_width=True)
+        
+        st.warning("Red dashed lines mark where results may thin due to Apr 29, 2025 cutoff.")
+        # ADD TEXT HERE 
+        st.info("Data coverage ends on **Apr 29, 2025**. Lines stop where follow-up is incomplete (right-censored; red dashed lines).")
+        st.markdown(
+            """
+            This issue has to do with how Chargebee delivers and stores data. Oliver had to cutoff all subscriptions by April 29, 2025 in order to reliably analyze our data.
+            These plots go up to 48 months as a way to start looking at long-term patterns. However, late-reaching months (especially for the end of cohort 2021, latter portion of cohort 2022, second half of 2023, most of cohort 2024, and all of cohort 2025) will look significantly lower simply because we cannot keep following them past April 2025.
+
+            """
+        )
+
+        # ADD TEXT HERE...
+        st.markdown("**NOTE:** The first month someone started, let's say October 2022, is their month 1. If that person has a subscription until October 2023, they have 13 months of a subscription. If that person does not renew the next month, *i.e. November 2023*, they have churned at month 14.")
+        
+        st.warning("Bottom line: long-term brand loyalty is strong.")
+        st.markdown(
+            """
+            When we compare long-term loyalty, we see that generally 44 - 50% of premium-plus (annual) members renew after their first year (i.e. at month 14). However, another 12 months later (i.e. at month 26) that number usually only drops 5 - 7% to 39 - 45% retention. That means just shy of half of premium-plus members are expected to renew after 2 years of their subscriptions. That is a very strong signal.
+            """
+        )
+
+        st.warning("Bottom line: this dashboard shows us previously undetected patterns in our data that are likely going to lead to high-value fixes / decisions.")
+        st.markdown(
+            """
+            We see that each cohort has premium-plus (annual) subscribers that are churning before their first 12 months of a membership. That is unexpected and is a consistent pattern that has been going unnoticed for years. They may had had payment failures, unexpected plan changes, or is an artifact of data mapping issues at the Chargebee level). This is something that requires further investigation and is a high-value fix.
+This dashboard is in beta mode (development mode) and likely has unpolished issues here and there. It is meant to show initial patterns in the data and generate discussion about the pros, cons, and features desired for this app to yield the highest value.
+            """
+        )
+
+        # ----------------------------
+
         # Also show a hazard heatmap by tenure month if hazard data is present.
         if 'Month' in haz.columns and 'Avg_Hazard' in haz.columns:
             import plotly.express as px
@@ -418,6 +710,9 @@ with tab1:
             hsel = hsel[hsel['Plan'].isin(sel_plans)] if 'Plan' in hsel.columns else hsel
             fig_hz = px.density_heatmap(hsel, x='Month', y='Plan', z='Avg_Hazard', color_continuous_scale='Reds',
                                         title='Hazard Heatmap by Tenure Month', nbinsx=24)
+            
+            # Reuse the survival-based thinning boundary so both plots align
+            #fig_hz = add_coverage_fence(fig_hz, thinning_x, max_x)
             st.plotly_chart(fig_hz, use_container_width=True)
     # If survival data is missing, provide a gentle note.
     else:
@@ -486,6 +781,7 @@ with tab2:
 # Backtest tab content: supports a custom multi-month window (e.g., Feb–Apr 2025).
 # ------------------------------------------------------------
 with tab3:
+    st.warning("IMPORTANT! The calculations in this tab have slightly incomplete code. As such, results are not final. View this tab as a rough prototype used to determine if the final version of this tool would likely be of high-value.")
     # Short, non-technical intro to the Backtest tab
     st.markdown(
         """
