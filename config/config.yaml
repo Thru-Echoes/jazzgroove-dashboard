@@ -17,11 +17,12 @@ paths:
 
 params:
   # Cohort grace months to merge small gaps
-  grace_months: 3
+  grace_months: 0
   # Max months to expand each subscriber timeline
   max_months: 48
   # Cap date for censoring (YYYY-MM-DD)
-  cap_date: "2025-04-29"
+  #cap_date: "2025-04-29"
+  cap_data: "2025-06-30"
 
   # The "as_of" date the watchlist is built for (end of month recommended)
   as_of: "2025-01-31"

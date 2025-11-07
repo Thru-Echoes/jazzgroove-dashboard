@@ -1,38 +1,20 @@
 
 # ------------------------------------------------------------
-# Import core libraries for I/O and computation.
+# Import dependencies 
 # ------------------------------------------------------------
 import os
 import math 
-# ------------------------------------------------------------
-# Import pandas for data wrangling and CSV I/O.
-# ------------------------------------------------------------
 import pandas as pd
-# ------------------------------------------------------------
-# Import numpy for numeric utilities.
-# ------------------------------------------------------------
 import numpy as np
-# ------------------------------------------------------------
-# Import yaml to read config values.
-# ------------------------------------------------------------
 import yaml
-# ------------------------------------------------------------
-# Import plotly for interactive charts in Streamlit.
-# ------------------------------------------------------------
 import plotly.express as px
-# ------------------------------------------------------------
-# Import datetime for date arithmetic.
-# ------------------------------------------------------------
 from datetime import datetime
-# ------------------------------------------------------------
-# Import Streamlit for the dashboard UI.
-# ------------------------------------------------------------
 import streamlit as st
 
 
 
 # ------------------------------------------------------------
-# Define a helper to read YAML config and return as a dict.
+# Helper to read YAML config and return as a dict.
 # ------------------------------------------------------------
 def load_config(path: str) -> dict:
     # Open and parse the YAML file to a Python dictionary.
@@ -40,13 +22,12 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 # ------------------------------------------------------------
-# Define a helper to safely load a CSV with optional date parsing.
+# Helper to safely load a CSV with optional date parsing.
 # ------------------------------------------------------------
 def load_csv(path: str, parse_dates=None) -> pd.DataFrame:
     # If the file exists at path, load it; otherwise return empty DataFrame.
     return pd.read_csv(path, parse_dates=parse_dates) if os.path.exists(path) else pd.DataFrame()
 
-# Above each line: explain the line below
 # Define a function that takes the survival dataframe currently being plotted
 def compute_thinning_month(surv_df, min_at_risk=30):
     # Ensure we have the columns we need
@@ -69,7 +50,7 @@ def compute_thinning_month(surv_df, min_at_risk=30):
     return int(supported.index.max()) + 0.5
 
 # -------------------------------
-# Helper: draw the fence on a Plotly figure (line chart or heatmap)
+# Helper to draw the fence on a Plotly figure (line chart or heatmap)
 # -------------------------------
 
 # Define a function to add a dashed red vline and soft shading to a Plotly figure
@@ -164,7 +145,7 @@ def add_fixed_cohort_fences_OLD(fig, cohort_order, fence_map, max_x, cols=3, sha
 
 def add_fixed_cohort_fences(fig, fence_map, max_x, shade=True, facet_col_name="Cohort Year"):
     """
-    Draw fixed, per‑cohort vertical fences on a faceted figure made by px.line(..., facet_col=facet_col_name).
+    Draw fixed, per-cohort vertical fences on a faceted figure made by px.line(..., facet_col=facet_col_name).
 
     fig           : Plotly figure
     fence_map     : dict {year_int: month_int or None}
@@ -223,8 +204,8 @@ def add_fixed_cohort_fences(fig, fence_map, max_x, shade=True, facet_col_name="C
 
 
 # ------------------------------------------------------------
-# Define a function to compute a dynamic watchlist as of an arbitrary date.
-# This mirrors the logic in your analysis notebooks.
+# Function to compute a dynamic watchlist as of an arbitrary date.
+# This mirrors the logic in the analysis notebooks.
 # ------------------------------------------------------------
 def compute_dynamic_watchlist(events_df: pd.DataFrame, hazard_df: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
     """Computes a dynamic watchlist for an arbitrary calendar month. 

@@ -1,0 +1,2 @@
+stage,rows_before,rows_after,delta_rows,accounts_before,accounts_after,delta_accounts,dropped_rows_total,drop_name_p_g,drop_email_paul_goldstein,drop_domain_jazzgroove,dropped_accounts_total
+EXCLUDE: ingest (paul/goldstein|@jazzgroove.com|@jazzgroove.org),19785,19574,-211,11237,11050,-187,211,176,67,138,187
