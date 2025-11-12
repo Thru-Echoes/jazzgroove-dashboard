@@ -46,7 +46,18 @@ What this script does under the hood
 - Pred_3mo_Risk = 1 - (1-h0)(1-h1)(1-h2)
 
 ```bash
-python scripts/01_prep_survival_and_risk.py
+python scripts/01_prep_survival_and_risk.py --events-path scripts/events.csv --cap 2025-12-31 --grace-days 90
+```
+
+Or, run with backtests: 
+
+```bash
+python scripts/01_prep_survival_and_risk.py \
+  --events-path scripts/events.csv \
+  --cap 2025-12-31 \
+  --grace-days 90 \
+  --backtest-as-of 2025-01-31 \
+  --backtest-horizon-months 3
 ```
 
 ### Step 3: Run Streamlit app 

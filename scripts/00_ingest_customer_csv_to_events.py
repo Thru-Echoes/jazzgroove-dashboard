@@ -138,7 +138,7 @@ def convert_customer_csv_to_events(in_customer_csv: str, out_events_csv: str) ->
 
     # 3) Normalize plan + Start/End; do NOT drop non-PP plans, we need all plans for brand windows
     df_excluded["Plan"]  = df_excluded["Current Plan Handle"].astype("string") if "Current Plan Handle" in df_excluded else df_excluded["Current Plan Handle"]
-    df_excluded["Plan"]  = df_excluded["Plan"].astype("string").fillna("").map(simplify_plan_handle)
+    #df_excluded["Plan"]  = df_excluded["Plan"].astype("string").fillna("").map(simplify_plan_handle)
 
     # Coerce dates
     df_excluded["Start"] = pd.to_datetime(df_excluded["Activation Date"], errors="coerce", utc=True)
@@ -153,19 +153,28 @@ def convert_customer_csv_to_events(in_customer_csv: str, out_events_csv: str) ->
     # (If you also want to drop the 'unknown' placeholder, uncomment the second mask line.)
     name_blank = df_excluded["Name_or_Email"].isna() | (df_excluded["Name_or_Email"].astype(str).str.strip() == "")
     # name_blank = name_blank | (df_filt["Name_or_Email"].str.lower() == "unknown")
-    df_out = df_excluded.loc[~name_blank, ["Name_or_Email", "Plan", "Start", "End"]].copy()
+    #df_out = df_excluded.loc[~name_blank, ["Name_or_Email", "Plan", "Start", "End"]].copy()
+    df_out = df_excluded.copy()
 
     # Sort for readability
     df_out = df_out.sort_values(["Name_or_Email", "Start"])
 
+    # FIXME: remove debugger
+    import pdb 
+    pdb.set_trace()
+
 
     # 5) Keep only essential columns for events.csv
-    events = (
+    events_OLD = (
         df_out[["Name_or_Email", "Plan", "Start", "End"]]
         .dropna(subset=["Name_or_Email", "Start"])
         .sort_values(["Name_or_Email", "Start"])
         .copy()
     )
+
+    # NEW Nov 11: KEEP ALL COLUMNS TO USE LATER 
+    keep_cols = ["Name_or_Email","Plan","Start","End","First Name","Last Name","Email"]
+    events = df_out[keep_cols].copy()
 
     # 6) Ensure output dir exists and write artifacts
     os.makedirs(os.path.dirname(out_events_csv), exist_ok=True)

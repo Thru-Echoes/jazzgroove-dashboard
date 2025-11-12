@@ -25,7 +25,8 @@ from pandas.api.types import is_datetime64tz_dtype
 # Project defaults
 # -----------------------
 ALLOWED_PLANS = {"premium-plus", "premium-plus-monthly"}
-CAP_DATE = pd.Timestamp("2025-12-31 23:59:59")  # right-censoring cutoff, if April 29, 2025 = "2024-04-29"
+#CAP_DATE = pd.Timestamp("2025-12-31 23:59:59")  # right-censoring cutoff, if April 29, 2025 = "2024-04-29"
+CAP_DATE = pd.Timestamp("2025-04-29 23:59:59")
 
 
 # ------------------------------------------------------------
@@ -237,9 +238,66 @@ def _apply_event_level_exclusions(
 
     return kept
 
-
-
 def merge_brand_intervals(
+    events: pd.DataFrame,
+    cap_date: pd.Timestamp = CAP_DATE,
+    grace_days: int = 0,
+    audit: Optional["AuditTracker"] = None,
+    stage_label: str = "MERGE: brand windows",
+) -> pd.DataFrame:
+    """
+    Collapse a member's subscription rows across ALL plans into brand-level intervals.
+    Intervals are merged if the gap between a window's end and the next window's start
+    is <= `grace_days`. All End dates are right-censored at `cap_date`.
+
+    Output per row: ['Name_or_Email','BrandStart','BrandEnd']
+    """
+    before = events.copy()
+
+    e = events.copy()
+    e["Start"] = pd.to_datetime(e["Start"], errors="coerce")
+    e["End"]   = pd.to_datetime(e["End"],   errors="coerce")
+
+    # Drop tz to avoid tz-aware vs tz-naive comparisons
+    for col in ("Start", "End"):
+        if is_datetime64tz_dtype(e[col]):
+            e[col] = e[col].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    e = e.dropna(subset=["Name_or_Email", "Start"])
+    cap = pd.to_datetime(cap_date)
+    e["End"] = e["End"].fillna(cap)
+    e.loc[e["End"] > cap, "End"] = cap
+
+    e = e.sort_values(["Name_or_Email", "Start"]).reset_index(drop=True)
+
+    rows = []
+    for name, g in e.groupby("Name_or_Email", sort=False):
+        cur_s = None
+        cur_e = None
+        for _, r in g.iterrows():
+            s, en = r["Start"], r["End"]
+            if cur_s is None:
+                cur_s, cur_e = s, en
+                continue
+            # Merge if the gap is within grace_days (or negative/zero)
+            gap_days = (s - cur_e).days if pd.notna(s) and pd.notna(cur_e) else None
+            if gap_days is None or gap_days <= max(grace_days, 0):
+                if en > cur_e:
+                    cur_e = en
+            else:
+                rows.append((name, cur_s, cur_e))
+                cur_s, cur_e = s, en
+        if cur_s is not None:
+            rows.append((name, cur_s, cur_e))
+
+    out = pd.DataFrame(rows, columns=["Name_or_Email", "BrandStart", "BrandEnd"])
+
+    if audit is not None:
+        note = f"members={before['Name_or_Email'].nunique()} -> windows={len(out)} ; grace_days={grace_days}"
+        audit.add(stage_label, before, out, note=note)
+    return out
+
+def merge_brand_intervals_OLD(
         events: pd.DataFrame, 
         cap_date: pd.Timestamp = CAP_DATE, 
         grace_days: int = 0,
@@ -287,27 +345,294 @@ def merge_brand_intervals(
 
 
 def derive_entry_plan(
-        events: pd.DataFrame, 
-        allowed_plans: Iterable[str] = ALLOWED_PLANS,
-        audit: Optional[AuditTracker] = None,
-        stage_label: str = "DERIVE: entry plan") -> pd.DataFrame:
+    events: pd.DataFrame,
+    allowed_plans: list[str] | set[str] | None = None,
+    plan_col: str = "Plan",
+) -> pd.DataFrame:
     """
-    Determine each member's Entry_Plan as the earliest of the allowed plans.
-    Returns: ['Name_or_Email', 'Entry_Plan', 'First_Start']
+    Return first-ever plan & start per member with NO plan-name remapping.
+    Columns: ['Name_or_Email','Entry_Plan','First_Start']
     """
-    before = events.copy()
-    e = events.copy()
-    e["Start"] = pd.to_datetime(e["Start"], errors="coerce")
-    e["Plan"] = e["Plan"].astype(str).str.lower()
+    d = events.copy()
+    d = d.dropna(subset=["Name_or_Email", plan_col, "Start"])
+    d["Start"] = pd.to_datetime(d["Start"], errors="coerce")
 
-    first = (
-        e[e["Plan"].isin(set(p.lower() for p in allowed_plans))]
-        .sort_values(["Name_or_Email", "Start"])
-        .groupby("Name_or_Email", as_index=False)
-        .first()[["Name_or_Email", "Plan", "Start"]]
-        .rename(columns={"Plan": "Entry_Plan", "Start": "First_Start"})
+    # Optional filter (default is None: no filtering)
+    if allowed_plans is not None:
+        d = d[d[plan_col].isin(allowed_plans)].copy()
+
+    first_rows = (
+        d.sort_values(["Name_or_Email", "Start"])
+         .groupby("Name_or_Email", as_index=False)
+         .first()   # the earliest row after sorting
     )
-    return first
+    out = first_rows.rename(columns={plan_col: "Entry_Plan", "Start": "First_Start"})
+    return out[["Name_or_Email", "Entry_Plan", "First_Start"]]
+
+
+# ------------------------------------------------------------
+# Cohort / plan slicing helpers for account_windows
+# ------------------------------------------------------------
+
+def ensure_cohort_year_column(
+    account_windows: pd.DataFrame,
+    first_start_col: str = "First_Start",
+    out_col: str = "Cohort Year",
+) -> pd.DataFrame:
+    """
+    Ensure an integer 'Cohort Year' column exists on account_windows.
+    We derive it from the year of the first activation (First_Start).
+    """
+    # Make a defensive copy so we don't mutate the caller
+    d = account_windows.copy()
+    # If the expected column isn't present yet, compute it from the 'First_Start' timestamp
+    if out_col not in d.columns:
+        d[out_col] = pd.to_datetime(d[first_start_col], errors="coerce").dt.year.astype("Int64")
+    # Return the augmented DataFrame
+    return d
+
+
+def split_by_cohort_year(
+    account_windows: pd.DataSheet,  # type: ignore (alias for readability)
+    cohort_year: int,
+    first_start_col: str = "First_Start",
+) -> pd.DataFrame:
+    """
+    Return only the rows from account_windows that belong to the requested cohort year,
+    defined by the year component of First_Start (or an existing 'Cohort Year' column if present).
+    """
+    # Ensure we have a 'Cohort Year' column to filter by
+    d = ensure_cohort_year_column(account_windows, first_start_col=first_start_col, out_col="Cohort Year")
+    # Filter rows where the derived cohort year equals the requested year
+    out = d[d["Cohort Year"] == cohort_year].copy()
+    # Return the filtered DataFrame
+    return out
+
+
+def split_by_entry_plans(
+    account_windows: pd.DataFrame,
+    plans: list[str],
+    plan_col: str = "Entry_Plan",
+) -> pd.DataFrame:
+    """
+    Return only rows whose entry plan value is in the user-specified list of plan labels.
+    Matching is done case-insensitively.
+    """
+    # Create a case-insensitive set of desired plan labels
+    target = {p.lower() for p in plans}
+    # Create a defensive copy
+    d = account_windows.copy()
+    # Create a temporary lowercase view of the plan column for matching
+    d["_plan_lc"] = d[plan_col].astype("string").str.lower()
+    # Filter rows whose normalized plan is in the target set
+    out = d[d["_plan_lc"].isin(target)].copy()
+    # Drop the helper column before returning
+    out = out.drop(columns=["_plan_lc"])
+    # Return the filtered DataFrame
+    return out
+
+
+# -----------------------
+# BUILD ONE ROW PER ACCOUNT (contiguous brand block) 
+# -----------------------
+
+def _extract_identities_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return unique identities ['Name_or_Email','First Name','Last Name','Email'] found in df,
+    or an empty DataFrame with those columns if not present.
+    """
+    wants = ["Name_or_Email", "First Name", "Last Name", "Email"]
+    have = [c for c in wants if c in df.columns]
+    if not have or "Name_or_Email" not in have:
+        # ensure we return these columns even if empty
+        return pd.DataFrame(columns=wants)
+    ids = df[have].copy()
+    # Lightweight normalization (do NOT lowercase the key; we rely on exact match)
+    ids["Name_or_Email"] = ids["Name_or_Email"].astype("string").str.strip()
+    return ids.drop_duplicates(subset=["Name_or_Email"])
+
+
+# --- NEW: Build one row per (account × contiguous brand block) without changing plan names ---
+def build_account_brand_blocks(
+    events: pd.DataFrame,
+    identities: pd.DataFrame | None = None,
+    grace_days: int = 0,
+    cap_date: str | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """
+    Inputs
+    ------
+    events      : DataFrame with at least ['Name_or_Email','Plan','Start','End'] (ALL plans; no renaming)
+    identities  : Optional DataFrame with ['Name_or_Email','First Name','Last Name','Email'] to enrich rows
+    grace_days  : Merge consecutive subscriptions into the same brand block if gap <= grace_days
+    cap_date    : Right-censoring date (e.g., '2025-04-29')
+
+    Output
+    ------
+    One row per Name_or_Email per contiguous brand block with columns:
+      Name_or_Email, First Name, Last Name, Email,
+      Entry_Plan, First_Start,
+      BrandStart, BrandEnd, LastMonth, Number_of_Subscriptions,
+      Cancel_ts, Cancel_Month_Index, censored,
+      had_other_plan_overlap, other_plans
+
+    Notes
+    -----
+    • No plan-name simplification or filtering is applied.
+    • LastMonth counts months from BrandStart→BrandEnd (1-indexed), so overlapping subs don’t double-count.
+    • Cancel_ts is BrandEnd iff not censored; censored means BrandEnd >= cap_date.
+    • other_plans are distinct plan slugs observed inside the block EXCLUDING the Entry_Plan.
+    """
+    d = events.copy()
+
+    d["Name_or_Email"] = d["Name_or_Email"].astype("string").str.strip()
+
+
+    # Datetime hygiene (tz-naive + cap)
+    d["Start"] = pd.to_datetime(d["Start"], errors="coerce")
+    d["End"]   = pd.to_datetime(d["End"],   errors="coerce")
+
+    if is_datetime64tz_dtype(d["Start"]):
+        d["Start"] = d["Start"].dt.tz_convert("UTC").dt.tz_localize(None)
+    if is_datetime64tz_dtype(d["End"]):
+        d["End"] = d["End"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    cap = None
+    if cap_date is not None:
+        cap = pd.to_datetime(cap_date)
+
+        # FIXME: remove debuggers 
+        #import pdb 
+        #pdb.set_trace()
+
+        # Fill open intervals with the cap, then clip any future End to cap
+        d["End"] = d["End"].fillna(cap)
+        d.loc[d["End"] > cap, "End"] = cap
+
+    # Make sure tz-naive (avoid tz-aware vs naive comparisons later)
+    for col in ("Start", "End"):
+        if pd.api.types.is_datetime64_any_dtype(d[col]):
+            try:
+                d[col] = d[col].dt.tz_localize(None)
+            except Exception:
+                pass
+
+    # Build contiguous brand windows across ALL plans (no renaming)
+    brand_windows = merge_brand_intervals(d, cap_date=cap_date, grace_days=grace_days)
+
+    # Derive Entry_Plan & First_Start from raw data (NO filtering/simplification)
+    ep = derive_entry_plan(d, allowed_plans=None, plan_col="Plan")  # ensure plan-preserving
+    ep["First_Start"] = pd.to_datetime(ep["First_Start"], errors="coerce")
+    try:
+        ep["First_Start"] = ep["First_Start"].dt.tz_localize(None)
+    except Exception:
+        pass
+
+    # Identity enrichment: prefer explicit identities; otherwise fall back to events
+    ident_keys = ["Name_or_Email", "First Name", "Last Name", "Email"]
+    if identities is not None and not identities.empty:
+        id_ok = [c for c in ident_keys if c in identities.columns]
+        ids = identities[id_ok].copy()
+    else:
+        ids = _extract_identities_from_df(d)  # <— pull identities from events if present
+
+    if not ids.empty:
+        ids["Name_or_Email"] = ids["Name_or_Email"].astype("string").str.strip()
+        ids = ids.drop_duplicates(subset=["Name_or_Email"])
+
+
+    out_rows = []
+
+
+    # Process per member
+    for name, g_win in brand_windows.sort_values(["Name_or_Email","BrandStart"]).groupby("Name_or_Email"):
+        # entry info
+        ep_row = ep.loc[ep["Name_or_Email"] == name]
+        if ep_row.empty:
+            entry_plan  = pd.NA
+            first_start = pd.NaT
+        else:
+            entry_plan  = ep_row["Entry_Plan"].iloc[0]
+            first_start = ep_row["First_Start"].iloc[0]
+
+        # identity info
+        if not ids.empty:
+            id_row = ids.loc[ids["Name_or_Email"] == name].head(1)
+            first_name = id_row["First Name"].iloc[0] if ("First Name" in id_row.columns and not id_row.empty) else pd.NA
+            last_name  = id_row["Last Name"].iloc[0] if ("Last Name"  in id_row.columns and not id_row.empty) else pd.NA
+            email      = id_row["Email"].iloc[0]      if ("Email"      in id_row.columns and not id_row.empty) else pd.NA
+        else:
+            first_name = last_name = email = pd.NA
+
+        # All events for this member (to count subs & detect other plans inside each block)
+        ev_m = d[d["Name_or_Email"] == name].copy()
+
+        for _, w in g_win.sort_values("BrandStart").iterrows():
+            bs = pd.to_datetime(w["BrandStart"], errors="coerce")
+            be = pd.to_datetime(w["BrandEnd"],   errors="coerce")
+            try:
+                bs = bs.tz_localize(None)
+                be = be.tz_localize(None)
+            except Exception:
+                pass
+
+            # Which raw subscriptions overlap this block?
+            in_block = ev_m[(ev_m["Start"] <= be) & (ev_m["End"] >= bs)]
+            nsubs    = int(len(in_block))
+
+            # Plans observed inside the block (distinct, preserve order)
+            plans_in_block = in_block["Plan"].astype(str).tolist()
+            # Other plans (distinct) compared to Entry_Plan
+            #other_list = sorted(pd.unique([p for p in plans_in_block if p != entry_plan]))
+            
+            other_list = sorted(set(p for p in plans_in_block if p != entry_plan))
+            had_other  = len(other_list) > 0
+
+            # Tenure in months (1-indexed) from BrandStart→BrandEnd
+            last_month = (
+                (be.year - bs.year) * 12 + (be.month - bs.month) + 1
+            ) if (pd.notna(bs) and pd.notna(be)) else pd.NA
+
+            # Censoring at cap
+            cens = False
+            if cap is not None and pd.notna(be):
+                cens = bool(be >= cap)
+
+            cancel_ts = pd.NaT if cens else be
+            cancel_mi = (
+                (be.year - first_start.year) * 12 + (be.month - first_start.month) + 1
+            ) if (pd.notna(be) and pd.notna(first_start)) else pd.NA
+
+            out_rows.append({
+                "Name_or_Email": name,
+                "First Name": first_name,
+                "Last Name": last_name,
+                "Email": email,
+
+                "Entry_Plan": entry_plan,     # first-ever plan (raw, unmodified)
+                "First_Start": first_start,   # first-ever start
+
+                "BrandStart": bs,
+                "BrandEnd": be,
+                "LastMonth": int(last_month) if last_month is not pd.NA else pd.NA,
+                "Number_of_Subscriptions": nsubs,
+
+                "Cancel_ts": cancel_ts,
+                "Cancel_Month_Index": int(cancel_mi) if cancel_mi is not pd.NA else pd.NA,
+                "censored": cens,
+
+                "had_other_plan_overlap": had_other,
+                "other_plans": ", ".join(other_list),
+            })
+
+    res = pd.DataFrame(out_rows)
+    # Stable ordering
+    if not res.empty:
+        res = res.sort_values(["Name_or_Email","BrandStart"], kind="stable").reset_index(drop=True)
+
+    return res
+
+
 
 # -----------------------
 # Survival & Hazard
@@ -462,6 +787,12 @@ def build_pooled_hazard_from_survival_and_windows(
     x["First_Start"] = pd.to_datetime(x["First_Start"], errors="coerce")
     x["BrandStart"]  = pd.to_datetime(x["BrandStart"], errors="coerce")
     x["BrandEnd"]    = pd.to_datetime(x["BrandEnd"],   errors="coerce")
+
+    # drop tz if present to avoid tz-aware vs tz-naive comparison errors
+    for col in ("First_Start", "BrandStart", "BrandEnd"):
+        if is_datetime64tz_dtype(x[col]):
+            x[col] = x[col].dt.tz_convert("UTC").dt.tz_localize(None)
+
     x = x.dropna(subset=["First_Start","BrandStart","BrandEnd"])
 
     # Find first exit (BrandEnd) at or after First_Start per member
@@ -556,7 +887,343 @@ def build_pooled_hazard_from_survival_and_windows_OLD(
 # ------------------------------------------------------------
 # Early-annual-churn forensics (who appears to exit before 12 months?)
 # ------------------------------------------------------------
+
 def find_early_annual_churn(
+    events: pd.DataFrame,
+    brand_windows: pd.DataFrame,
+    entry_plans: pd.DataFrame,
+    months: int = 12,
+    cap_date: pd.Timestamp = CAP_DATE,
+) -> pd.DataFrame:
+    """
+    Identify premium-plus *entry* members whose *contiguous brand* tenure from the start
+    of the brand block that contains their First_Start is < `months` (default: 12) and
+    who are NOT censored by the cap date.
+
+    Assumptions & semantics:
+      • `events` is the ALL-plans normalized events table: ['Name_or_Email','Plan','Start','End'].
+      • `brand_windows` is built from ALL plans via merge_brand_intervals(..., grace_days=...),
+        so any PP→PPM (or other plan) switches with gaps <= grace_days are *already merged*
+        into a single contiguous brand window.
+      • `entry_plans` is from derive_entry_plan(events), includes:
+            ['Name_or_Email','Entry_Plan','First_Start'] where Entry_Plan ∈ {'premium-plus','premium-plus-monthly'}.
+      • We restrict to Entry_Plan == 'premium-plus' (annual cohort).
+      • For each annual member, we find the brand window that *contains* their First_Start.
+        That window’s BrandStart/BrandEnd define the contiguous brand block used for tenure.
+      • LastMonth is computed as 1-indexed months from BrandStart to BrandEnd (contiguous brand tenure).
+        This counts time across *any plans* within the brand block (PP→PPM transitions inside `grace_days` included).
+      • A member is counted as "early" if LastMonth < `months` and NOT censored (BrandEnd < cap_date).
+
+    Returns one row per Name_or_Email with stable column names:
+      ['Name_or_Email','Entry_Plan','First_Start','BrandStart','BrandEnd',
+       'LastMonth','Cancel_ts','Cancel_Month_Index','censored',
+       'had_other_plan_overlap','other_plans']
+
+      - First_Start: first start on the ENTRY plan (unchanged)
+      - BrandStart/BrandEnd: start/end of the contiguous brand block that contains First_Start
+      - LastMonth: months from BrandStart to BrandEnd (1-indexed, contiguous brand tenure)
+      - Cancel_ts: BrandEnd if not censored, else NaT
+      - Cancel_Month_Index: months from First_Start to BrandEnd (1-indexed, for backwards compatibility)
+      - censored: True if BrandEnd >= cap_date (brand still active at cap)
+      - had_other_plan_overlap: True if any non-PP plan overlaps [BrandStart, BrandEnd]
+      - other_plans: comma-separated list of distinct non-PP plan slugs overlapping the block
+    """
+    cap = pd.to_datetime(cap_date)
+
+    # Normalize inputs defensively
+    e = events.copy()
+    e["Plan"]  = e["Plan"].astype(str).str.lower()
+    e["Start"] = pd.to_datetime(e["Start"], errors="coerce")
+    e["End"]   = pd.to_datetime(e["End"],   errors="coerce")
+
+    bw = brand_windows.copy()
+    bw["BrandStart"] = pd.to_datetime(bw["BrandStart"], errors="coerce")
+    bw["BrandEnd"]   = pd.to_datetime(bw["BrandEnd"],   errors="coerce")
+
+    ep = entry_plans.copy()
+    ep["Entry_Plan"]   = ep["Entry_Plan"].astype(str).str.lower()
+    ep["First_Start"]  = pd.to_datetime(ep["First_Start"], errors="coerce")
+
+    # Focus on annual (premium-plus) entry only
+    ep_pp = ep[ep["Entry_Plan"] == "premium-plus"].copy()
+    if ep_pp.empty:
+        return pd.DataFrame(
+            columns=[
+                "Name_or_Email","Entry_Plan","First_Start","BrandStart","BrandEnd",
+                "LastMonth","Cancel_ts","Cancel_Month_Index","censored",
+                "had_other_plan_overlap","other_plans"
+            ]
+        )
+
+    # Join brand windows to entry info
+    x = bw.merge(ep_pp[["Name_or_Email","Entry_Plan","First_Start"]],
+                 on="Name_or_Email", how="inner")
+    x = x.dropna(subset=["First_Start","BrandStart","BrandEnd"]).copy()
+
+    out_rows = []
+
+    for name, g in x.groupby("Name_or_Email"):
+        g = g.sort_values("BrandStart")
+        fs = g["First_Start"].iloc[0]
+
+        # find the brand window(s) that contain First_Start
+        cov = g[(g["BrandStart"] <= fs) & (g["BrandEnd"] >= fs)]
+
+        if not cov.empty:
+            # because brand_windows is already merged by grace_days, there is typically one row here
+            brand_start = cov["BrandStart"].min()
+            brand_end   = cov["BrandEnd"].max()
+        else:
+            # Fallback: if no window contains First_Start (unexpected), pick the first window starting after fs
+            after = g[g["BrandStart"] >= fs].sort_values("BrandStart")
+            if after.empty:
+                # No window at/after entry → treat as anomaly; keep the latest end before fs
+                sel = g.iloc[[-1]]
+            else:
+                sel = after.iloc[[0]]
+            brand_start = sel["BrandStart"].iloc[0]
+            brand_end   = sel["BrandEnd"].iloc[0]
+
+        # Contiguous brand tenure from BrandStart to BrandEnd (1-indexed months)
+        # This counts PP and any other plans merged into this block by grace_days.
+        last_month = (
+            (brand_end.year - brand_start.year) * 12
+            + (brand_end.month - brand_start.month)
+            + 1
+        )
+
+        # Censoring at cap date
+        cens = bool(brand_end >= cap)
+
+        # For backwards compatibility:
+        cancel_ts = pd.NaT if cens else brand_end
+        cancel_month_from_first = (
+            (brand_end.year - fs.year) * 12 + (brand_end.month - fs.month) + 1
+        )
+
+        # Context: did they have any non-PP plan overlapping this contiguous block?
+        any_other_mask = (
+            (e["Name_or_Email"] == name)
+            & (e["Plan"] != "premium-plus")
+            & (e["Start"] < brand_end)
+            & (e["End"]   > brand_start)
+        )
+        other_plans = sorted(e.loc[any_other_mask, "Plan"].dropna().unique().tolist())
+        had_other_overlap = len(other_plans) > 0
+
+        out_rows.append({
+            "Name_or_Email": name,
+            "Entry_Plan": g["Entry_Plan"].iloc[0],
+            "First_Start": fs,
+            "BrandStart": brand_start,
+            "BrandEnd": brand_end,
+            "LastMonth": int(last_month) if pd.notna(brand_end) and pd.notna(brand_start) else pd.NA,
+            "Cancel_ts": cancel_ts,
+            "Cancel_Month_Index": int(cancel_month_from_first) if pd.notna(brand_end) and pd.notna(fs) else pd.NA,
+            "censored": cens,
+            "had_other_plan_overlap": had_other_overlap,
+            "other_plans": ", ".join(other_plans),
+        })
+
+    early = pd.DataFrame(out_rows)
+
+    # One row per account, no duplicates expected; if any, collapse by taking max BrandEnd/min BrandStart
+    if not early.empty and early.duplicated("Name_or_Email").any():
+        # merge duplicates conservatively: earliest BrandStart, latest BrandEnd, recompute durations/flags
+        early = (
+            early.sort_values(["Name_or_Email","BrandStart","BrandEnd"])
+                 .groupby("Name_or_Email", as_index=False)
+                 .agg({
+                     "Entry_Plan":"first",
+                     "First_Start":"min",
+                     "BrandStart":"min",
+                     "BrandEnd":"max",
+                     "censored":"max",
+                     "had_other_plan_overlap":"max",
+                     "other_plans": lambda s: ", ".join(sorted(set(", ".join(s.dropna()).split(", ")))) if s.notna().any() else "",
+                 })
+        )
+        # recompute tenure fields
+        early["LastMonth"] = (
+            (early["BrandEnd"].dt.year - early["BrandStart"].dt.year) * 12
+            + (early["BrandEnd"].dt.month - early["BrandStart"].dt.month)
+            + 1
+        ).astype("Int64")
+        early["Cancel_ts"] = early.apply(lambda r: pd.NaT if r["BrandEnd"] >= cap else r["BrandEnd"], axis=1)
+        early["Cancel_Month_Index"] = (
+            (early["BrandEnd"].dt.year - early["First_Start"].dt.year) * 12
+            + (early["BrandEnd"].dt.month - early["First_Start"].dt.month)
+            + 1
+        ).astype("Int64")
+
+    # Order columns consistently
+    cols = [
+        "Name_or_Email","Entry_Plan","First_Start","BrandStart","BrandEnd",
+        "LastMonth","Cancel_ts","Cancel_Month_Index","censored",
+        "had_other_plan_overlap","other_plans"
+    ]
+    for c in cols:
+        if c not in early.columns:
+            early[c] = pd.NA
+    early = early[cols].sort_values(["First_Start","Name_or_Email"]).reset_index(drop=True)
+
+    return early
+
+
+
+def find_early_annual_churn_OLD(
+    events: pd.DataFrame,
+    brand_windows: pd.DataFrame,
+    entry_plans: pd.DataFrame,
+    months: int = 12,
+    cap_date: pd.Timestamp = CAP_DATE,
+) -> pd.DataFrame:
+    """
+    Identify *premium-plus (annual entry)* members whose *continuous* brand coverage
+    from First_Start ends before `months` (e.g., 12) months, after merging plan windows
+    with `merge_brand_intervals(..., grace_days=...)`.
+
+    One row per Name_or_Email:
+      - 'brand_coverage_start' = First_Start (from entry_plans).
+      - 'brand_coverage_end'   = BrandEnd of the merged brand window that *covers* First_Start.
+      - 'tenure_months_at_end' = 1-indexed month at coverage end (BrandEnd vs First_Start), may be negative
+      - 'early_churn_ltN'      = True if not censored and tenure_months_at_end < months
+      - 'brand_censored_at_cap' flagged if brand_coverage_end >= cap_date (cannot know real end)
+      - 'anomaly_no_window_at_entry' True if no brand window covers First_Start (data issue)
+      - 'anomaly_negative_months' True if tenure_months_at_end < 1 (indicates data problem)
+      - 'had_nonpp_any_after_start' and 'nonpp_plans_first_year' are *informational* (not used to suppress churn)
+
+    IMPORTANT:
+      This function assumes brand_windows were built with the desired `grace_days` so that
+      plan switches within grace are already merged into one window. If PP → PPM occurs
+      within grace_days, it is part of the same 'continuous' window and counts toward
+      tenure; if the gap exceeds grace, it does not.
+    """
+    cap = pd.to_datetime(cap_date)
+
+    # Normalize and lower-case plan
+    e = events.copy()
+    e["Plan"]  = e["Plan"].astype(str).str.lower()
+    e["Start"] = pd.to_datetime(e["Start"], errors="coerce")
+    e["End"]   = pd.to_datetime(e["End"],   errors="coerce")
+
+    bw = brand_windows.copy()
+    bw["BrandStart"] = pd.to_datetime(bw["BrandStart"], errors="coerce")
+    bw["BrandEnd"]   = pd.to_datetime(bw["BrandEnd"],   errors="coerce")
+
+    ep = entry_plans.copy()
+    ep["Entry_Plan"]  = ep["Entry_Plan"].astype(str).str.lower()
+    ep["First_Start"] = pd.to_datetime(ep["First_Start"], errors="coerce")
+
+    # Premium-plus entry cohort
+    ep_pp = ep[ep["Entry_Plan"] == "premium-plus"].copy()
+    if ep_pp.empty:
+        return pd.DataFrame(columns=[
+            "Name_or_Email","Entry_Plan",
+            #"brand_first_start_any","brand_windows_count",
+            "BrandStart", "brand_windows_count",
+            #"brand_coverage_start","brand_coverage_end",
+            "First_Start","LastMonth",
+            "brand_censored_at_cap",
+            "tenure_months_at_end","anomaly_no_window_at_entry","anomaly_negative_months",
+            "early_churn_ltN","had_nonpp_any_after_start","nonpp_plans_first_year"
+        ])
+
+    # Diagnostic: earliest brand start across all plans
+    brand_first = (
+        bw.groupby("Name_or_Email", as_index=False)["BrandStart"]
+          .min()
+          .rename(columns={"BrandStart": "brand_first_start_any"})
+    )
+
+    # Join brand windows to entry to limit to members with PP entry
+    df = bw.merge(ep_pp[["Name_or_Email", "Entry_Plan", "First_Start"]], on="Name_or_Email", how="right")
+
+    # Select the contiguous brand coverage window that COVERS First_Start
+    def pick_window_covering_entry(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("BrandStart")
+        fs = g["First_Start"].iloc[0]
+        cover = g[(g["BrandStart"] <= fs) & (g["BrandEnd"] >= fs)]
+        anomaly_no_window = False
+        if not cover.empty:
+            end = cover["BrandEnd"].max()  # windows already merged by grace_days; take max to be safe
+            cov_start = fs                 # contiguous coverage from entry starts at First_Start
+        else:
+            # Data anomaly: no brand window covers entry
+            anomaly_no_window = True
+            after = g[g["BrandStart"] >= fs].sort_values("BrandStart")
+            # If no window after entry, end=last seen end; else end of the first window after entry
+            end = (after["BrandEnd"].iloc[0] if not after.empty else g["BrandEnd"].max())
+            cov_start = fs
+        return pd.Series({"brand_coverage_start": cov_start, "brand_coverage_end": end, "anomaly_no_window_at_entry": anomaly_no_window})
+
+    picked = (
+        df.groupby("Name_or_Email", as_index=False)
+          .apply(pick_window_covering_entry)
+          .reset_index(drop=True)
+    )
+
+    # Merge diagnostics
+    win_counts = df.groupby("Name_or_Email").size().reset_index(name="brand_windows_count")
+    base = (
+        ep_pp.merge(brand_first, on="Name_or_Email", how="left")
+             .merge(picked, on="Name_or_Email", how="left")
+             .merge(win_counts, on="Name_or_Email", how="left")
+    )
+
+    # Censor & tenure from First_Start to contiguous brand end
+    base["brand_censored_at_cap"] = base["brand_coverage_end"] >= cap
+    base["tenure_months_at_end"] = (
+        (base["brand_coverage_end"].dt.year  - base["First_Start"].dt.year)  * 12 +
+        (base["brand_coverage_end"].dt.month - base["First_Start"].dt.month) + 1
+    ).astype("Int64")
+
+    base["anomaly_negative_months"] = base["tenure_months_at_end"].notna() & (base["tenure_months_at_end"] < 1)
+
+    base["early_churn_ltN"] = (
+        base["brand_censored_at_cap"].eq(False) &
+        base["tenure_months_at_end"].notna() &
+        (base["tenure_months_at_end"] < np.int64(months))
+    )
+
+    # Informational context on non-PP after start and overlapping first year (not used to suppress churn)
+    ectx = e[e["Name_or_Email"].isin(base["Name_or_Email"])]
+    ectx["Plan"]  = ectx["Plan"].str.lower()
+    ectx["Start"] = pd.to_datetime(ectx["Start"], errors="coerce")
+    ectx["End"]   = pd.to_datetime(ectx["End"],   errors="coerce")
+
+    def nonpp_ctx(row):
+        sid = row["Name_or_Email"]
+        fs  = row["First_Activation"] if "First_Activation" in row else row["brand_coverage_start"]
+        fy  = row["brand_coverage_start"] + pd.DateOffset(months=months)
+        sub = ectx[(ectx["Name_or_Email"] == sid) & (ectx["Plan"] != "premium-plus")]
+        if sub.empty:
+            return pd.Series({"had_nonpp_any_after_start": False, "nonpp_plans_first_year": ""})
+        any_after = bool((sub["End"] > fs).any())
+        ov = (sub["Start"] < fy) & (sub["End"] > fs)
+        plans = ", ".join(sorted(sub.loc[ov, "Plan"].dropna().unique().tolist()))
+        return pd.Series({"had_nonpp_any_after_start": any_after, "nonpp_plans_first_year": plans})
+
+    ctx = base.apply(nonpp_ctx, axis=1)
+    base = pd.concat([base, ctx], axis=1)
+
+    # Keep only early-churn rows
+    early = base[base["early_churn_ltN"] == True].copy()
+
+    # Final columns (one row per member)
+    keep_cols = [
+        "Name_or_Email", "Entry_Plan",
+        "brand_first_start_any", "brand_windows_count",
+        "brand_coverage_start", "brand_coverage_end", "brand_censored_at_cap",
+        "tenure_months_at_end", "anomaly_no_window_at_entry", "anomaly_negative_months",
+        "early_churn_ltN",
+        "had_nonpp_any_after_start", "nonpp_plans_first_year",
+    ]
+    return early.loc[:, keep_cols].sort_values(["brand_coverage_start", "tenure_months_at_end", "Name_or_Email"])
+
+
+
+def find_early_annual_churn_OLD2(
     events: pd.DataFrame,
     brand_windows: pd.DataFrame,
     entry_plans: pd.DataFrame,
@@ -649,7 +1316,7 @@ def build_survival_and_hazard(
 
     events = _normalize_event_columns(d, cap_date=cap_date, audit=audit, stage_label="NORMALIZE: raw->events" if not already_events else "VERIFY: events (normalize)")
     brand_windows = merge_brand_intervals(events, cap_date=cap_date, grace_days=grace_days, audit=audit, stage_label="MERGE: brand windows")
-    entry_plans   = derive_entry_plan(events, allowed_plans=allowed_plans, audit=audit, stage_label="DERIVE: entry plan")
+    entry_plans   = derive_entry_plan(events, allowed_plans=allowed_plans)
 
     if entry_plans.empty or brand_windows.empty:
         surv = pd.DataFrame(columns=["Plan","Cohort Year","Month","At_Risk","Retention"])
@@ -789,186 +1456,298 @@ def build_gap_adjusted_intervals(d: pd.DataFrame, grace_months: int = 0, cap_dat
     return merge_brand_intervals(events, cap_date=cap_date, grace_days=grace_days)
 
 
-# -----------------------
-# OLD: maybe need to delete? 
-# -----------------------
+# ------------------------------------------------------------
+# Brand-tenure summary from account_windows
+# ------------------------------------------------------------
 
-def build_gap_adjusted_intervals_OLD(df,
-                                 grace_months=0,
-                                 cap_date='2025-12-31',
-                                 merge_across_plans=False,
-                                 plan_col='Plan'):
+def compute_avg_brand_tenure(
+    account_windows: pd.DataFrame,
+    # Optional: restrict to these entry-plan labels (case-insensitive)
+    include_plans: list[str] | None = None,
+    # When True, also compute an aggregate row 'both' over these plans
+    include_both: bool = True,
+    both_plans: tuple[str, str] = ("premium-plus", "premium-plus-monthly"),
+    # When True, also compute an aggregate 'all' across all entry plans
+    include_all: bool = True,
+    # Name of the entry plan column
+    plan_col: str = "Entry_Plan",
+    # Name of the first activation timestamp column
+    first_start_col: str = "First_Start",
+    # Name of the monthly tenure column (if missing, we compute it)
+    tenure_col: str = "LastMonth",
+    # Name of the right-censor flag column (if missing, we compute it from BrandEnd and cap_date)
+    censored_col: str = "censored",
+    # Right-censoring cutoff if 'censored' is unavailable
+    cap_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """
-    Merge subscription intervals with a grace window.
-    If merge_across_plans=True, merge across all plans per user (brand-level).
-    Else, merge within each plan per user (plan-level).
+    Compute brand-tenure summary per entry plan and cohort year.
+
+    Returns a DataFrame with columns:
+      ['Entry_Plan','Cohort Year','members','avg_tenure_months',
+       'median_tenure_months','std_tenure_months','censored_share'].
+
+    - 'members' counts distinct Name_or_Email within each (plan,year) group.
+    - 'avg/median/std' summarize the 'tenure_col' values (treated as months).
+    - 'censored_share' is the fraction of rows with censored==True in the group.
+    - You can limit to specific entry plans via include_plans.
+    - Set include_browse 'both' to also compute an aggregate for both_plans (e.g., ('premium-plus','premium-plus-monthly')).
+    - Set include_all to also compute a single aggregate across all entry plans present.
     """
-    cap_dt = pd.to_datetime(cap_date)
-    d = df.copy()
-    # Ensure columns exist & are datetimes
-    if plan_col not in d.columns:
-        d[plan_col] = d['Current Plan Handle']
-    d['Activation Date'] = pd.to_datetime(d['Activation Date'])
-    d['End Date'] = pd.to_datetime(d['End Date']).fillna(cap_dt).clip(upper=cap_dt)
+    # Start from a defensive copy
+    d = account_windows.copy()
 
-    # Grouping key: across plans (brand) or within plan
-    keys = ['Name_or_Email'] if merge_across_plans else ['Name_or_Email', plan_col]
+    # Ensure we have a 'Cohort Year'
+    d = ensure_cohort_year_column(d, first_start_col=first_start_col, out_col="Cohort Year")
 
-    rows = []
-    for key, g in d.sort_values(keys + ['Activation Date']).groupby(keys):
-        g = g.reset_index(drop=True)
-        cur_s = g.loc[0, 'Activation Date']
-        cur_e = g.loc[0, 'End Date']
-        for i in range(1, len(g)):
-            s = g.loc[i, 'Activation Date']
-            e = g.loc[i, 'End Date']
-            # Merge if within grace (or overlapping)
-            if (grace_months is None) or (s <= cur_e + relativedelta(months=grace_months)):
-                cur_e = max(cur_e, e)
-            else:
-                out = {'Name_or_Email': g.loc[0, 'Name_or_Email'],
-                       'Start': cur_s, 'End': cur_e}
-                if not merge_across_plans: out[plan_col] = g.loc[0, plan_col]
-                rows.append(out)
-                cur_s = s 
-                cur_e = e
-        out = {'Name_or_Email': g.loc[0, 'Name_or_Email'],
-               'Start': cur_s, 'End': cur_e}
-        if not merge_across_plans: out[plan_col] = g.loc[0, plan_col]
-        rows.append(out)
+    # Normalize types for plan and optionally filter by plans
+    d[plan_col] = d[plan_col].astype("string")
+    if include_plans is not None and len(include_plans) > 0:
+        # Build a case-insensitive filter
+        keep = {p.lower() for p in include_plans}
+        d = d[d[plan_col].str.lower().isin(keep)].copy()
 
-    intervals = pd.DataFrame(rows)
-    # For brand-level, assign a single plan label so downstream code works unchanged
-    if merge_across_plans:
-        intervals[plan_col] = 'All'  # a single brand label
-    return intervals
+    # Ensure we have a numeric tenure column; if missing, compute from BrandStart/BrandEnd
+    if tenure_col not in d.columns:
+        # Compute tenure in months from BrandStart->BrandEnd (Month 1 is the start month)
+        d[tenure_col] = (
+            (pd.to_datetime(d["BrandEnd"]).dt.year  - pd.to_datetime(d["BrandStart"]).dt.year) * 12 +
+            (pd.to_datetime(d["BrandEnd"]).dt.month - pd.to_datetime(d["BrandStart"]).dt.month) + 1
+        ).astype("Int64")
 
-def expand_intervals_to_records_OLD(intervals, max_months=24):
-    """
-    Expand ['Name_or_Email','Plan','Start','End'] to user-month records with Month index from first start.
-    Returns: ['Name_or_Email','Plan','Cohort Year','Month']
-    """
-    rows = []
+    # Ensure we have a boolean 'censored' column, or derive it from cap_date
+    if censored_col not in d.columns:
+        # If caller didn't pass a cap_date, we can't infer; set to False rather than erroring
+        if cap_date is None:
+            d[censored_col] = False
+        else:
+            d[censored_col] = (pd.to_datetime(d["BrandEnd"]) >= pd.to_datetime(cap_date))
 
-    first = (
-        intervals
-        .groupby(['Name_or_Email','Plan'])['Start']
-        .min()
-        .reset_index(name='First_Start')
+    # Compute the base summary by (Entry_Plan, Cohort Year)
+    base = (
+        d.groupby([plan_col, "Cohort Year"])
+         .agg(
+             members=("Name_or_Email", lambda s: s.nunique()),
+             avg_tenure_months=(tenure_col, "mean"),
+             median_tenure_months=(tenure_col, "median"),
+             std_tenure_months=(tenure_col, "std"),
+             censored_share=(censored_col, "mean"),
+         )
+         .reset_index()
+         .rename(columns={plan_col: "Entry_Plan"})
     )
 
-    fdict = {(r.Name_or_Email, r.Plan): r.First_Start for r in first.itertuples()}
+    # Prepare a list of frames to concatenate
+    frames = [base]
 
-    for r in intervals.itertuples(index=False):
-        user = r.Name_or_Email
-        plan = r.Plan
-        s = pd.to_datetime(r.Start)
-        e = pd.to_datetime(r.End)
-        start0 = fdict[(user, plan)]
-        cohort_year = start0.year
-        m = ((s.year - start0.year) * 12 + (s.month - start0.month) + 1)
-        cur = s
+    # Optionally add a 'both' aggregate across the two specified plans
+    if include_both:
+        # Lowercase set for matching
+        both_set = {p.lower() for p in both_plans}
+        # Filter only those two plans
+        d_both = d[d[plan_col].str.lower().isin(both_set)].copy()
+        if not d_both.empty:
+            both_summary = (
+                d_both.groupby("Cohort Year")
+                      .agg(
+                          members=("Name_or_Email", lambda s: s.nunique()),
+                          avg_tenure_months=(tenure_col, "mean"),
+                          median_tenure_months=(tenure_col, "median"),
+                          std_tenure_months=(tenure_col, "std"),
+                          censored_share=(censored_col, "mean"),
+                      )
+                      .reset_index()
+            )
+            # Tag the aggregate as 'both'
+            both_summary.insert(0, "Entry_Plan", "both")
+            frames.append(both_summary)
 
-        while cur <= e and m <= max_months:
-            rows.append({
-                'Name_or_Email': user,
-                'Plan': plan,
-                'Cohort Year': cohort_year,
-                'Month': m
-            })
-            cur = cur + relativedelta(months=1)
-            m = m + 1
+    # Optionally add an 'all' aggregate across all entry plans present
+    if include_all:
+        all_summary = (
+            d.groupby("Cohort Year")
+             .agg(
+                 members=("Name_or_Email", lambda s: s.nunique()),
+                 avg_tenure_months=(tenure_col, "mean"),
+                 median_tenure_months=(tenure_col, "median"),
+                 std_tenure_months=(tenure_col, "std"),
+                 censored_share=(censored_col, "mean"),
+             )
+             .reset_index()
+        )
+        all_summary.insert(0, "Entry_Plan", "all")
+        frames.append(all_summary)
 
-    return pd.DataFrame(rows)
+    # Concatenate all pieces into the final summary table
+    out = pd.concat(frames, ignore_index=True)
 
-def map_entry_plan_OLD(df, plan_col='Plan'):
-    """
-    Map each user to their *plan of entry* (first plan ever taken).
-    Returns: DataFrame ['Name_or_Email','Entry_Plan','First_Start']
-    """
-    tmp = df.copy()
+    # FIXME: remove debugger 
+    #import pdb 
+    #pdb.set_trace()
 
-    if plan_col not in tmp.columns:
-        tmp[plan_col] = tmp['Current Plan Handle']
-
-    tmp['Activation Date'] = pd.to_datetime(tmp['Activation Date'])
-
-    first = (
-        tmp.sort_values(['Name_or_Email','Activation Date'])
-           .groupby('Name_or_Email')
-           .first()
-           .reset_index()
-    )
-
-    out = first[['Name_or_Email', plan_col, 'Activation Date']].copy()
-    out = out.rename(columns={plan_col: 'Entry_Plan', 'Activation Date': 'First_Start'})
-
+    # Order the columns exactly as requested
+    out = out[["Entry_Plan","Cohort Year","members","avg_tenure_months","median_tenure_months"]]
     return out
 
-def survival_from_records_OLD(rec_df):
+
+# ---------------------
+# Conversions 
+# ---------------------
+
+def compute_first_plan_changes(
+    events: pd.DataFrame,
+    id_col: str   = "Name_or_Email",
+    plan_col: str = "Plan",
+    start_col: str = "Start",
+    # first activation column to determine the clock start for the horizon window
+    first_start_col: str = "First_Start",
+) -> pd.DataFrame:
     """
-    Compute survival by (Cohort Year, Plan, Month) from user-month records.
-    Returns: ['Cohort Year','Plan','Month','Active','Cohort Size','Retention','Churn Rate']
+    For each member on the event timeline:
+      - Identify their first (entry) plan and its first_start timestamp.
+      - Find the first subsequent event where plan != entry plan.
+      - Return one row per member with first change info (or NaN if none).
+    Output columns:
+      ['Name_or_Email','Entry_Plan','First_Start','First_Change_Plan','First_Change_Start','Months_to_Change'].
     """
-    cohort_sizes = (
-        rec_df[rec_df['Month'] == 1]
-        .groupby(['Cohort Year','Plan'])['Name_or_Email']
-        .nunique()
-        .reset_index(name='Cohort Size')
+    # Defensive copy
+    e = events.copy()
+    # Normalize key columns
+    e[id_col]    = e[id_col].astype("string").str.strip()
+    e[plan_col]  = e[plan_col].astype("string").str.strip()
+    e[start_col] = pd.to_datetime(e[start_col], errors="coerce")
+    # Build each member's entry record (first activation)
+    firsts = (
+        e.sort_values([id_col, start_col])
+         .groupby(id_col, as_index=False)
+         .first()
+         [[id_col, plan_col, start_col]]
+         .rename(columns={plan_col: "Entry_Plan", start_col: "First_Start"})
+    )
+    # Join back to all rows to label them with each member's entry plan + first start
+    e2 = e.merge(firsts, on=id_col, how="left")
+    # Keep only rows strictly AFTER the first start
+    e2 = e2[e2[start_col] > e2["First_Start"]].copy()
+    # Remove rows where the plan hasn't changed (same as entry)
+    e2 = e2[e2[plan_col] != e2["Entry_Plan"]].copy()
+    # Get the earliest change per member
+    first_change = (
+        e2.sort_values([id_col, start_col])
+          .groupby(id_col, as_index=False)
+          .first()
+    )
+    # Compute months from entry to first change (Month 1 = month of entry)
+    first_change["Months_to_Change"] = (
+        (first_change[start_col].dt.year  - first_change["First_Start"].dt.year) * 12
+        + (first_change[start_col].dt.month - first_change["First_Start"].dt.month)
+        + 1
+    ).astype("Int64")
+
+    # Keep only columns of interest
+    out = first_change[[id_col, "Entry_Plan", "First_Start", plan_col, start_col, "Months_to_Change"]].copy()
+    # Rename new columns clearly
+    out = out.rename(columns={plan_col: "First_Change_Plan", start_col: "First_Change_Start"})
+    return out
+
+def summarize_conversions(
+    first_changes: pd.DataFrame,
+    account_windows: pd.DataFrame,
+    horizon_months: int = 12,
+    # When grouping by cohort too, pass by=["Entry_Cohort","Entry_Plan","First_Change_Plan"]
+    by: list[str] = ["Entry_Plan", "First_Change_Plan"],
+) -> pd.DataFrame:
+    """
+    Aggregate first-change events into conversion rates.
+    - 'first_changes' is the 1-row-per-member output of compute_first_plan_changes()
+    - 'account_windows' gives you denominators (members per entry plan/cohort)
+
+    Returns a DataFrame with counts AND rates:
+      group columns (per 'by') + ['conversions_within','entry_members','conversion_rate'].
+    """
+    # Defensive copies
+    fc = first_changes.copy()
+    aw = account_windows.copy()
+
+    # Attach Entry Cohort for optional grouping
+    aw["Cohort Year"] = pd.to_datetime(aw["First_Start"], errors="coerce").dt.year
+    
+
+    # FIXME: remove debugger 
+    #import pdb 
+    #pdb.set_trace()
+
+    # One row per member for denominators
+    entrants = (
+        aw.sort_values(["Name_or_Email","First_Start"])
+          .drop_duplicates(subset=["Name_or_Email"])
+          [["Name_or_Email","Cohort Year","Entry_Plan"]]
+          .copy()
     )
 
-    active = (
-        rec_df
-        .groupby(['Cohort Year','Plan','Month'])['Name_or_Email']
-        .nunique()
-        .reset_index(name='Active')
+    # ---- Filter first changes to those within the horizon ----
+    if "Months_to_Change" not in fc.columns:
+        raise KeyError("first_changes is missing 'Months_to_Change'")
+
+    fc["Within_Horizon"] = fc["Months_to_Change"].le(horizon_months)
+
+    # Avoid Entry_Plan column collision: drop any pre-existing Entry_Plan / Entry_Cohort on fc
+    # (we'll take the canonical values from 'entrants')
+    for col in ("Entry_Plan","Entry_Cohort"):
+        if col in fc.columns:
+            fc = fc.drop(columns=[col])
+
+    # Merge in denominators' keys (canonical Entry_Plan / Entry_Cohort)
+    fc = fc.merge(
+        entrants,
+        on="Name_or_Email",
+        how="left",
+        validate="one_to_one"  # first_changes should be 1 row per member
     )
 
-    surv = active.merge(cohort_sizes, on=['Cohort Year','Plan'], how='left')
-    surv['Retention'] = surv['Active'] / surv['Cohort Size']
-    surv['Churn Rate'] = 1 - surv['Retention']
+    # ---- Build numerator: conversions within horizon grouped by requested keys ----
+    # Only rows that actually changed within the horizon count in the numerator
+    numer = (
+        fc[fc["Within_Horizon"]]
+        .groupby([k for k in by if k in fc.columns], as_index=False)
+        .agg(conversions_within=("Name_or_Email","nunique"))
+    )
 
-    return surv
+    # FIXME: remove debugger 
+    #import pdb 
+    #pdb.set_trace()
 
-
-def compute_average_monthly_hazard_OLD(surv_df, weight_by_cohort=True):
-    """
-    Input: survival DF with ['Plan','Cohort Year','Month','Active','Cohort Size', 'Retention Rate' or 'Retention']
-    Output: average hazard per month for each Plan (and overall if Plan='All').
-
-    hazard_t = (R_{t-1} - R_t) / R_{t-1}, averaged across cohorts.
-    If weight_by_cohort=True, cohorts are weighted by their size (Month==1).
-    """
-    df = surv_df.copy()
-    # Normalize retention column name
-    if 'Retention' in df.columns:
-        df['R'] = df['Retention']
+    # ---- Build denominator counts: unique entrants per relevant entry keys ----
+    # Denominator grouping keys are the subset of 'by' that belong to entrants (Entry_Plan / Entry_Cohort)
+    entry_keys = [k for k in by if k in ("Entry_Plan","Cohort Year")]
+    if entry_keys:
+        denom = (
+            entrants.groupby(entry_keys, as_index=False)
+                    .agg(entry_members=("Name_or_Email","nunique"))
+        )
     else:
-        df['R'] = df['Retention Rate']
+        # If user didn't group by any entry key, denominator is global entrants count
+        denom = pd.DataFrame({
+            "entry_members": [entrants["Name_or_Email"].nunique()]
+        })
 
-    # cohort weights
-    w = (df[df['Month']==1][['Plan','Cohort Year','Cohort Size']]
-         .drop_duplicates()
-         .rename(columns={'Cohort Size':'Weight'}))
+    # ---- Join numerators to denominators and compute rates ----
+    # Determine join keys between numer and denom
+    join_keys = entry_keys.copy()
+    # If 'First_Change_Plan' is in by, it doesn't belong to the denominator;
+    # left-merge numerator onto denom with the entry keys, then fill NaNs
+    out = denom.merge(numer, on=join_keys, how="left")
+    out["conversions_within"] = out["conversions_within"].fillna(0).astype(int)
 
-    # Compute hazard per (Plan, Cohort Year, Month)
-    df = df.sort_values(['Plan','Cohort Year','Month'])
-    df['R_prev'] = df.groupby(['Plan','Cohort Year'])['R'].shift(1)
-    df['Hazard'] = (df['R_prev'] - df['R']) / df['R_prev']
-    df.loc[df['Month']==1, 'Hazard'] = np.nan  # undefined at Month 1
+    # Compute conversion rate safely
+    out["conversion_rate"] = (out["conversions_within"] / out["entry_members"]).replace([np.inf, -np.inf], 0.0)
 
-    # Merge weights
-    df = df.merge(w, on=['Plan','Cohort Year'], how='left')
+    # Reorder: put all group columns first, then metrics
+    ordered_cols = [k for k in by if k in out.columns] + ["entry_members","conversions_within","conversion_rate"]
+    # Include 'Entry_Cohort' if requested but not in 'by' (rare)
+    for k in ("Entry_Plan","Cohort Year","First_Change_Plan"):
+        if (k in out.columns) and (k not in ordered_cols):
+            ordered_cols.insert(0, k)
 
-    # Average by month & plan
-    if weight_by_cohort:
-        out = (df.dropna(subset=['Hazard'])
-                 .groupby(['Plan','Month'])
-                 .apply(lambda g: np.average(g['Hazard'], weights=g['Weight']))
-                 .reset_index(name='Avg_Hazard'))
-    else:
-        out = (df.dropna(subset=['Hazard'])
-                 .groupby(['Plan','Month'])['Hazard']
-                 .mean()
-                 .reset_index(name='Avg_Hazard'))
+    out = out[ordered_cols].sort_values(by=[c for c in by if c in out.columns])
+
     return out
